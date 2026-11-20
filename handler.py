@@ -107,48 +107,45 @@ def _resolve_model_root() -> Path:
         root = vol / "glyphatlas_models"
         root.mkdir(parents=True, exist_ok=True)
         return root
-    root = Path("/tmp/glyphatlas_models")
+    # NEVER use /tmp (often RAM-backed tmpfs on cloud hosts!). Use container overlay disk /app/models_cache.
+    root = Path("/app/models_cache")
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def _ensure_model_files(model_root: Path) -> tuple[Path, Path]:
     """
-    Download public ungated weights once onto persistent RunPod Network Volume:
+    Download public ungated weights ONCE directly into HF_HOME on container disk / Network Volume
+    with ZERO duplicate local_dir copying (34 GB total instead of 68 GB!):
       1) Fr0zencr4nE/GlyphAtlas transformer (~23.8 GB, 5 shards)
       2) unsloth/FLUX.1-dev non-transformer files (VAE + CLIP + T5-XXL + scheduler, ~10.1 GB)
     """
-    ga_dir = model_root / "glyphatlas"
-    ckpt_dir = ga_dir / "transformer"
-    base_dir = model_root / "flux_base"
+    hf_cache = model_root / "hf_cache"
+    hf_cache.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(hf_cache)
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_cache / "hub")
+    # Use steady streaming downloads (max_workers=2) to avoid RAM spikes from 16x concurrent 5GB chunks
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-    ga_ready = (ckpt_dir / "diffusion_pytorch_model-00005-of-00005.safetensors").exists() and (
-        ckpt_dir / "config.json"
-    ).exists()
-    if not ga_ready:
-        t0 = time.monotonic()
-        print(f"[GlyphAtlas] Downloading Fr0zencr4nE/GlyphAtlas transformer -> {ga_dir} ...", flush=True)
+    t0 = time.monotonic()
+    print(f"[GlyphAtlas] Ensuring Fr0zencr4nE/GlyphAtlas transformer in {hf_cache} ...", flush=True)
+    ga_snap = Path(
         snapshot_download(
             repo_id="Fr0zencr4nE/GlyphAtlas",
-            local_dir=str(ga_dir),
+            cache_dir=str(hf_cache / "hub"),
             allow_patterns=["transformer/*"],
-            local_dir_use_symlinks=False,
+            max_workers=2,
         )
-        print(f"[GlyphAtlas] Downloaded GlyphAtlas transformer in {time.monotonic() - t0:.1f}s", flush=True)
-
-    base_ready = (
-        (base_dir / "vae" / "diffusion_pytorch_model.safetensors").exists()
-        and (base_dir / "text_encoder" / "model.safetensors").exists()
-        and (base_dir / "text_encoder_2" / "model-00002-of-00002.safetensors").exists()
-        and (base_dir / "scheduler" / "scheduler_config.json").exists()
-        and (base_dir / "model_index.json").exists()
     )
-    if not base_ready:
-        t0 = time.monotonic()
-        print(f"[GlyphAtlas] Downloading unsloth/FLUX.1-dev base components -> {base_dir} ...", flush=True)
+    ckpt_dir = ga_snap / "transformer"
+    print(f"[GlyphAtlas] GlyphAtlas transformer ready at {ckpt_dir} ({time.monotonic() - t0:.1f}s)", flush=True)
+
+    t1 = time.monotonic()
+    print(f"[GlyphAtlas] Ensuring unsloth/FLUX.1-dev base components in {hf_cache} ...", flush=True)
+    base_dir = Path(
         snapshot_download(
             repo_id="unsloth/FLUX.1-dev",
-            local_dir=str(base_dir),
+            cache_dir=str(hf_cache / "hub"),
             allow_patterns=[
                 "model_index.json",
                 "scheduler/*",
@@ -158,10 +155,10 @@ def _ensure_model_files(model_root: Path) -> tuple[Path, Path]:
                 "tokenizer/*",
                 "tokenizer_2/*",
             ],
-            local_dir_use_symlinks=False,
+            max_workers=2,
         )
-        print(f"[GlyphAtlas] Downloaded FLUX base components in {time.monotonic() - t0:.1f}s", flush=True)
-
+    )
+    print(f"[GlyphAtlas] FLUX base ready at {base_dir} ({time.monotonic() - t1:.1f}s)", flush=True)
     return ckpt_dir, base_dir
 
 
@@ -186,29 +183,31 @@ def _ensure_pipeline() -> tuple[StableTrainingPipeline, dict[str, Any]]:
     model_root = _resolve_model_root()
     ckpt_dir, base_dir = _ensure_model_files(model_root)
 
+    # Load 12B transformer directly in BF16 and move to CUDA BEFORE loading T5-XXL
+    # so host CPU RAM never peaks above ~14 GB!
     t0 = time.monotonic()
     transformer, info = AtlasTransformer.from_pretrained(
         str(ckpt_dir),
         torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
         output_loading_info=True,
         local_files_only=True,
     )
     if any(info.get(k) for k in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
         raise RuntimeError(f"AtlasTransformer strict load mismatch: {info}")
     transformer.eval().requires_grad_(False)
+    transformer.to(device=device, dtype=torch.bfloat16)
+    gc.collect()
+    print(f"[GlyphAtlas] Loaded 12B AtlasTransformer onto {device} in {time.monotonic() - t0:.1f}s", flush=True)
 
     pipe = FluxFillPipeline.from_pretrained(
         str(base_dir),
         transformer=transformer,
         torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
         local_files_only=True,
     )
 
-    # VRAM strategy:
-    #   >= 64 GB (A100-80GB / H100 / RTX PRO 6000 96GB): keep full pipeline on GPU (~34 GB)
-    #   <  64 GB (A40 / L40S / A6000 / RTX 6000 Ada 48GB): keep transformer + VAE on GPU (~24.3 GB),
-    #            offload CLIP + T5-XXL to CPU after encoding the prompt once per font job!
-    pipe.transformer.to(device=device, dtype=torch.bfloat16)
     pipe.vae.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
 
     if _VRAM_GB >= 64.0:
@@ -228,6 +227,8 @@ def _ensure_pipeline() -> tuple[StableTrainingPipeline, dict[str, Any]]:
 
     _PIPE = pipe
     _MODEL_CONFIG = model_config
+    gc.collect()
+    torch.cuda.empty_cache()
     print(
         f"[GlyphAtlas] Pipeline ready in {time.monotonic() - t0:.1f}s "
         f"(offload_text_encoders={_OFFLOAD_TEXT_ENCODERS}, dtype={pipe.dtype}, device={pipe.device})",
@@ -636,6 +637,29 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     t_start = time.monotonic()
     job_input = job.get("input") or {}
     action = str(job_input.get("action") or "synthesize").strip().lower()
+
+    if action == "diag":
+        import shutil
+        gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
+        vram = round(torch.cuda.get_device_properties(0).total_memory / (1024.0 ** 3), 1) if torch.cuda.is_available() else 0.0
+        disk_app = shutil.disk_usage("/app")
+        disk_tmp = shutil.disk_usage("/tmp")
+        mem_info = {}
+        try:
+            for line in Path("/proc/meminfo").read_text().splitlines()[:5]:
+                k, v = line.split(":", 1)
+                mem_info[k.strip()] = v.strip()
+        except Exception:
+            pass
+        return {
+            "status": "ok",
+            "gpu": gpu,
+            "vram_gb": vram,
+            "app_free_gb": round(disk_app.free / (1024.0 ** 3), 1),
+            "tmp_free_gb": round(disk_tmp.free / (1024.0 ** 3), 1),
+            "mem_info": mem_info,
+            "model_root": str(_resolve_model_root()),
+        }
 
     try:
         pipe, model_config = _ensure_pipeline()
