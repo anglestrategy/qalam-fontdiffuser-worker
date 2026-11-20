@@ -25,14 +25,16 @@ RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 
 # Verify every Qwen-Image-2.1 + LoRA + vtracer + runpod import succeeds at build time
 RUN python3 -c "\
-import torch, transformers, diffusers, peft, accelerate, cv2, scipy, vtracer, runpod; \
+import torch, transformers, diffusers, peft, accelerate, cv2, scipy, vtracer, runpod, jinja2; \
 from diffusers import QwenImage21Pipeline, FlowMatchEulerDiscreteScheduler; \
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor; \
+assert tuple(int(x) for x in jinja2.__version__.split('.')[:3]) >= (3, 1, 6), jinja2.__version__; \
 print('QWEN_IMAGE_21_BUILD_IMPORTS_OK', \
       'torch=', torch.__version__, \
       'transformers=', transformers.__version__, \
       'diffusers=', diffusers.__version__, \
-      'peft=', peft.__version__)"
+      'peft=', peft.__version__, \
+      'jinja2=', jinja2.__version__)"
 
 COPY handler.py /app/handler.py
 
