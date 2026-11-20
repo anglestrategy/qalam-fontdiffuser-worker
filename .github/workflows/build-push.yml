@@ -30,6 +30,6 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/qalam-fontdiffuser-worker:latest
-            ghcr.io/${{ github.repository_owner }}/qalam-fontdiffuser-worker:v2
+            ghcr.io/${{ github.repository_owner }}/qalam-fontdiffuser-worker:v3
           cache-from: type=gha
           cache-to: type=gha,mode=max
