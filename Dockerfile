@@ -1,13 +1,13 @@
-# Qalam Foundry — RunPod Serverless Flex GPU Worker (GlyphAtlas 12B FLUX)
-# Runs Fr0zencr4nE/GlyphAtlas (12B FLUX-based multilingual scene-text & glyph synthesis)
-# on 48GB+ / 80GB+ BF16 CUDA GPUs with zero local MacBook RAM usage.
-FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+# Qalam Foundry — RunPod Serverless Flex GPU Worker (Qwen-Image-2.1 + 4-Step Lightning LoRA)
+# Runs Qwen/Qwen-Image-2.1 (compact 7B DiT + Qwen3-VL multimodal encoder, native Arabic &
+# multi-reference image editing, public ungated weights) on 48GB+ / 80GB+ BF16 CUDA GPUs
+# with zero local MacBook RAM usage.
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
-    GLYPH_OMNI_ROOT=/app/GlyphAtlas
+    HF_HUB_DOWNLOAD_TIMEOUT=120
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -20,24 +20,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Clone official GlyphAtlas repository and bootstrap hash-pinned AMAP-ML/FluxText sources
-RUN git clone --depth 1 https://github.com/Fr0zenCrane/GlyphAtlas.git /app/GlyphAtlas \
-    && cd /app/GlyphAtlas \
-    && python3 tools/bootstrap_upstream.py
-
 COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 
-# Verify every GlyphAtlas + FluxText + vtracer + runpod import succeeds at build time
-RUN python3 -c "import sys; sys.path[:0]=['/app/GlyphAtlas/runtime','/app/GlyphAtlas/runtime/scripts','/app/GlyphAtlas/runtime/scripts/reproduce_flux_text','/app/GlyphAtlas/vendor/FluxText']; \
-    import common; \
-    from glyph_atlas.model import AtlasTransformer; \
-    from glyph_atlas.data import make_routes; \
-    from pipeline_precision import StableTrainingPipeline; \
-    from src.flux.condition import Condition; \
-    from src.flux.generate_fill import generate_fill; \
-    import vtracer, runpod, hf_transfer; \
-    print('GLYPHATLAS_BUILD_IMPORTS_OK')"
+# Verify every Qwen-Image-2.1 + LoRA + vtracer + runpod import succeeds at build time
+RUN python3 -c "\
+import torch, transformers, diffusers, peft, accelerate, cv2, scipy, vtracer, runpod; \
+from diffusers import QwenImage21Pipeline, FlowMatchEulerDiscreteScheduler; \
+from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor; \
+print('QWEN_IMAGE_21_BUILD_IMPORTS_OK', \
+      'torch=', torch.__version__, \
+      'transformers=', transformers.__version__, \
+      'diffusers=', diffusers.__version__, \
+      'peft=', peft.__version__)"
 
 COPY handler.py /app/handler.py
 

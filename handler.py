@@ -1,24 +1,25 @@
 """
-Qalam Foundry — RunPod Serverless Flex GPU Worker (GlyphAtlas 12B FLUX)
+Qalam Foundry — RunPod Serverless Flex GPU Worker (Qwen-Image-2.1 + 4-Step Lightning LoRA)
 
-True 1:1 Arabic + Latin neural font synthesis using Fr0zencr4nE/GlyphAtlas
-(12B FLUX-based multilingual glyph synthesis model, public ungated weights)
-paired with unsloth/FLUX.1-dev non-transformer components (VAE + CLIP + T5-XXL).
+True 1:1 Arabic + Latin neural font synthesis using Qwen/Qwen-Image-2.1
+(compact 7B DiT + Qwen3-VL multimodal encoder, native Arabic & multi-reference image editing,
+public ungated weights) accelerated with lightx2v/Qwen-Image-2.1-Lightning (4-step LoRA).
 
 Architecture:
-  - Packs up to 8 target glyphs per 512x512 sheet (2 rows x 4 cols, exact 16px
-    latent-patch grid with unmasked white gutters).
-  - Unmasked top strip (y = 0..176) displays the user's ACTUAL reference image on
-    pure #FFFFFF white so FLUX's 12B global self-attention directly transfers exact
-    stroke thickness, geometric bowls, curves, terminal cuts, and square/round dots.
-  - Each masked cell (112x144, inner 112x112 baseline-locked box) receives:
-      1) Scene-aligned white-on-black skeleton in `condition` (anchors exact baseline
-         & origin for HarfBuzz Arabic cursive shaping)
-      2) 64x64 VAE-encoded glyph tile in `atlas` routed via `make_routes()` (anchors
-         character identity & Arabic dot count/placement without PIL Arabic bugs).
-  - Supports both `exact_clone` and `inspired` modes.
-  - Vectorizes each generated cell with smooth bicubic upsampling -> adaptive ink
-    extraction -> stroke-matched Arabic baseline connector bridging -> vtracer spline SVG.
+  - Packs up to 16 glyphs per 1024x1024 specimen sheet (4x4 grid, 256x256 per glyph!)
+    OR 9 glyphs per 1024x1024 sheet (3x3 grid, 341x341 per glyph!).
+  - Passes TWO crisp visual references into QwenImage21Pipeline:
+      Image 1: HarfBuzz-shaped Arabic contextual + Latin glyph skeletons locked on exact
+               baselines inside a clean 4x4 grid on pure #FFFFFF white.
+      Image 2: The user's crisp reference typography image cleanly normalized onto #FFFFFF.
+    (Also supports layout_mode="in_context" for single-canvas reference-above-grid A/B tests.)
+  - Supports BOTH:
+      * 4-step Lightning LoRA mode (~2-3s per 16-glyph sheet on H100 80GB!)
+      * Full base multi-step mode (LoRA disabled, 16-30 steps for ultra-fine detail!)
+  - Supports both `exact_clone` and `inspired` generation modes.
+  - Extracts crisp anti-aliased masks (preserving ultra-thin hairlines & square dots),
+    applies stroke-matched Arabic cursive connector locking, and traces smooth spline SVGs
+    via vtracer.
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ import base64
 import gc
 import io
 import os
-import sys
+import shutil
 import time
 import traceback
 from pathlib import Path
@@ -36,75 +37,41 @@ import cv2
 import numpy as np
 import runpod
 import torch
-import torch.nn.functional as F
 import vtracer
-import yaml
-from PIL import Image
+from diffusers import FlowMatchEulerDiscreteScheduler, QwenImage21Pipeline
+from huggingface_hub import snapshot_download
+from PIL import Image, ImageDraw
 from scipy import ndimage
 
-# Ensure GlyphAtlas + vendored AMAP-ML/FluxText are on sys.path
-GLYPHATLAS_ROOT = Path(os.environ.get("GLYPH_OMNI_ROOT", "/app/GlyphAtlas")).resolve()
-os.environ["GLYPH_OMNI_ROOT"] = str(GLYPHATLAS_ROOT)
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-for p in (
-    str(GLYPHATLAS_ROOT / "runtime"),
-    str(GLYPHATLAS_ROOT / "runtime" / "scripts"),
-    str(GLYPHATLAS_ROOT / "runtime" / "scripts" / "reproduce_flux_text"),
-    str(GLYPHATLAS_ROOT / "vendor" / "FluxText"),
-):
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
-from diffusers import FluxFillPipeline
-from huggingface_hub import snapshot_download
-from glyph_atlas.data import make_routes
-from glyph_atlas.model import AtlasTransformer
-from pipeline_precision import StableTrainingPipeline
-from src.flux.condition import Condition
-from src.flux.generate_fill import generate_fill
-
+BASE_MODEL_ID = "Qwen/Qwen-Image-2.1"
+LIGHTNING_LORA_ID = "lightx2v/Qwen-Image-2.1-Lightning"
+LIGHTNING_WEIGHT_NAME = "pytorch_lora_weights.safetensors"
 
 # ---------------------------------------------------------------------------
 # Global persistent state across warm RunPod Serverless requests
 # ---------------------------------------------------------------------------
-_PIPE: StableTrainingPipeline | None = None
-_MODEL_CONFIG: dict[str, Any] | None = None
-_OFFLOAD_TEXT_ENCODERS: bool = False
-_PROMPT_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+_PIPE: QwenImage21Pipeline | None = None
+_BASE_SCHEDULER: FlowMatchEulerDiscreteScheduler | None = None
+_LIGHTNING_SCHEDULER: FlowMatchEulerDiscreteScheduler | None = None
+_LORA_LOADED: bool = False
+_LORA_ENABLED: bool = False
 _GPU_NAME: str = "unknown"
 _VRAM_GB: float = 0.0
-
-# 16px-aligned 2x4 cell grid on a 512x512 canvas:
-#   Top unmasked reference strip: y = 0..176 (11 latent rows)
-#   Unmasked white gutter:        y = 176..192 (1 latent row)
-#   Row 0 cells (112x144 each):   y = 192..336 (9 latent rows)
-#   Unmasked white gutter:        y = 336..352 (1 latent row)
-#   Row 1 cells (112x144 each):   y = 352..496 (9 latent rows)
-#   Bottom unmasked margin:       y = 496..512 (1 latent row)
-#   4 columns (112px wide each):  x = 16..128, 144..256, 272..384, 400..512
-CELL_W = 112
-CELL_H = 144
-INNER_BOX = 112
-INNER_Y_PAD = 16  # centered vertically inside 144px cell: [y0+16 : y0+128]
-COL_X = (16, 144, 272, 400)
-ROW_Y = (192, 352)
-CELL_BOXES: list[tuple[int, int, int, int]] = [
-    (x0, y0, x0 + CELL_W, y0 + CELL_H)
-    for y0 in ROW_Y
-    for x0 in COL_X
-]
+_OFFLOAD_ENABLED: bool = False
 
 
 def _resolve_model_root() -> Path:
-    custom = os.environ.get("GLYPH_MODEL_CACHE", "").strip()
+    custom = os.environ.get("QWEN_MODEL_CACHE", "").strip()
     if custom:
         root = Path(custom)
         root.mkdir(parents=True, exist_ok=True)
         return root
     vol = Path("/runpod-volume")
     if vol.exists() and os.access(str(vol), os.W_OK):
-        root = vol / "glyphatlas_models"
+        root = vol / "qwen21_models"
         root.mkdir(parents=True, exist_ok=True)
         return root
     # NEVER use /tmp (often RAM-backed tmpfs on cloud hosts!). Use container overlay disk /app/models_cache.
@@ -113,391 +80,452 @@ def _resolve_model_root() -> Path:
     return root
 
 
+def _snapshot_with_retry(
+    repo_id: str,
+    cache_dir: Path,
+    allow_patterns: list[str] | None = None,
+    max_attempts: int = 3,
+) -> Path:
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            t0 = time.monotonic()
+            print(
+                f"[Qwen2.1] Downloading/verifying {repo_id} (attempt {attempt}/{max_attempts}) into {cache_dir} ...",
+                flush=True,
+            )
+            kwargs: dict[str, Any] = {
+                "repo_id": repo_id,
+                "cache_dir": str(cache_dir),
+                "max_workers": 2,
+            }
+            if allow_patterns is not None:
+                kwargs["allow_patterns"] = allow_patterns
+            snap = Path(snapshot_download(**kwargs))
+            print(f"[Qwen2.1] {repo_id} ready at {snap} ({time.monotonic() - t0:.1f}s)", flush=True)
+            return snap
+        except Exception as exc:
+            last_exc = exc
+            print(f"[Qwen2.1] Download attempt {attempt} failed for {repo_id}: {exc}", flush=True)
+            if attempt < max_attempts:
+                time.sleep(4 * attempt)
+    raise RuntimeError(f"Failed to download {repo_id} after {max_attempts} attempts: {last_exc}")
+
+
 def _ensure_model_files(model_root: Path) -> tuple[Path, Path]:
     """
     Download public ungated weights ONCE directly into HF_HOME on container disk / Network Volume
-    with ZERO duplicate local_dir copying (34 GB total instead of 68 GB!):
-      1) Fr0zencr4nE/GlyphAtlas transformer (~23.8 GB, 5 shards)
-      2) unsloth/FLUX.1-dev non-transformer files (VAE + CLIP + T5-XXL + scheduler, ~10.1 GB)
+    with ZERO duplicate local_dir copying (~30.9 GB total!):
+      1) Qwen/Qwen-Image-2.1 (~30.86 GB: Qwen3-VL + 7B DiT + VAE)
+      2) lightx2v/Qwen-Image-2.1-Lightning (0.06 GB 4-step LoRA)
     """
     hf_cache = model_root / "hf_cache"
-    hf_cache.mkdir(parents=True, exist_ok=True)
+    hub_dir = hf_cache / "hub"
+    hub_dir.mkdir(parents=True, exist_ok=True)
     os.environ["HF_HOME"] = str(hf_cache)
-    os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_cache / "hub")
-    # Use steady streaming downloads (max_workers=2) to avoid RAM spikes from 16x concurrent 5GB chunks
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(hub_dir)
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-    t0 = time.monotonic()
-    print(f"[GlyphAtlas] Ensuring Fr0zencr4nE/GlyphAtlas transformer in {hf_cache} ...", flush=True)
-    ga_snap = Path(
-        snapshot_download(
-            repo_id="Fr0zencr4nE/GlyphAtlas",
-            cache_dir=str(hf_cache / "hub"),
-            allow_patterns=["transformer/*"],
-            max_workers=2,
-        )
+    base_dir = _snapshot_with_retry(
+        BASE_MODEL_ID,
+        hub_dir,
+        allow_patterns=[
+            "model_index.json",
+            "scheduler/*",
+            "vae/*",
+            "text_encoder/*",
+            "tokenizer/*",
+            "processor/*",
+            "transformer/*",
+        ],
     )
-    ckpt_dir = ga_snap / "transformer"
-    print(f"[GlyphAtlas] GlyphAtlas transformer ready at {ckpt_dir} ({time.monotonic() - t0:.1f}s)", flush=True)
-
-    t1 = time.monotonic()
-    print(f"[GlyphAtlas] Ensuring unsloth/FLUX.1-dev base components in {hf_cache} ...", flush=True)
-    base_dir = Path(
-        snapshot_download(
-            repo_id="unsloth/FLUX.1-dev",
-            cache_dir=str(hf_cache / "hub"),
-            allow_patterns=[
-                "model_index.json",
-                "scheduler/*",
-                "vae/*",
-                "text_encoder/*",
-                "text_encoder_2/*",
-                "tokenizer/*",
-                "tokenizer_2/*",
-            ],
-            max_workers=2,
-        )
+    lora_dir = _snapshot_with_retry(
+        LIGHTNING_LORA_ID,
+        hub_dir,
+        allow_patterns=[LIGHTNING_WEIGHT_NAME],
     )
-    print(f"[GlyphAtlas] FLUX base ready at {base_dir} ({time.monotonic() - t1:.1f}s)", flush=True)
-    return ckpt_dir, base_dir
+    return base_dir, lora_dir
 
 
-def _ensure_pipeline() -> tuple[StableTrainingPipeline, dict[str, Any]]:
-    global _PIPE, _MODEL_CONFIG, _OFFLOAD_TEXT_ENCODERS, _GPU_NAME, _VRAM_GB
+def _ensure_pipeline() -> QwenImage21Pipeline:
+    global _PIPE, _BASE_SCHEDULER, _LIGHTNING_SCHEDULER
+    global _LORA_LOADED, _LORA_ENABLED, _GPU_NAME, _VRAM_GB, _OFFLOAD_ENABLED
 
-    if _PIPE is not None and _MODEL_CONFIG is not None:
-        return _PIPE, _MODEL_CONFIG
+    if _PIPE is not None:
+        return _PIPE
 
     if not torch.cuda.is_available():
-        raise RuntimeError("GlyphAtlas worker requires a CUDA GPU with BF16 support.")
+        raise RuntimeError("Qwen-Image-2.1 worker requires a CUDA GPU with BF16 support.")
     if not torch.cuda.is_bf16_supported():
-        raise RuntimeError("GPU does not support bfloat16 required by GlyphAtlas.")
+        raise RuntimeError("GPU does not support bfloat16 required by Qwen-Image-2.1.")
 
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     props = torch.cuda.get_device_properties(0)
     _GPU_NAME = props.name
     _VRAM_GB = props.total_memory / (1024.0 ** 3)
-    print(f"[GlyphAtlas] Initializing on {_GPU_NAME} ({_VRAM_GB:.1f} GB VRAM)...", flush=True)
+    print(f"[Qwen2.1] Initializing on {_GPU_NAME} ({_VRAM_GB:.1f} GB VRAM)...", flush=True)
 
     model_root = _resolve_model_root()
-    ckpt_dir, base_dir = _ensure_model_files(model_root)
+    base_dir, lora_dir = _ensure_model_files(model_root)
 
-    # Load 12B transformer directly in BF16 and move to CUDA BEFORE loading T5-XXL
-    # so host CPU RAM never peaks above ~14 GB!
     t0 = time.monotonic()
-    transformer, info = AtlasTransformer.from_pretrained(
-        str(ckpt_dir),
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        output_loading_info=True,
-        local_files_only=True,
-    )
-    if any(info.get(k) for k in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
-        raise RuntimeError(f"AtlasTransformer strict load mismatch: {info}")
-    transformer.eval().requires_grad_(False)
-    transformer.to(device=device, dtype=torch.bfloat16)
-    gc.collect()
-    print(f"[GlyphAtlas] Loaded 12B AtlasTransformer onto {device} in {time.monotonic() - t0:.1f}s", flush=True)
-
-    pipe = FluxFillPipeline.from_pretrained(
+    pipe = QwenImage21Pipeline.from_pretrained(
         str(base_dir),
-        transformer=transformer,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         local_files_only=True,
     )
 
-    pipe.vae.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
+    # Save exact base scheduler before configuring Lightning scheduler
+    _BASE_SCHEDULER = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
+    _LIGHTNING_SCHEDULER = FlowMatchEulerDiscreteScheduler.from_config(
+        pipe.scheduler.config,
+        num_train_timesteps=1000,
+        use_dynamic_shifting=True,
+        time_shift_type="exponential",
+        base_image_seq_len=256,
+        max_image_seq_len=8192,
+        base_shift=0.5,
+        max_shift=0.9,
+        shift_terminal=None,
+    )
 
-    if _VRAM_GB >= 64.0:
-        _OFFLOAD_TEXT_ENCODERS = False
-        pipe.text_encoder.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
-        pipe.text_encoder_2.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
+    # Load 4-step Lightning LoRA (can be toggled on/off per request with zero reload!)
+    pipe.load_lora_weights(
+        str(lora_dir),
+        weight_name=LIGHTNING_WEIGHT_NAME,
+        adapter_name="lightning",
+    )
+    _LORA_LOADED = True
+    _LORA_ENABLED = True
+    pipe.scheduler = _LIGHTNING_SCHEDULER
+
+    if _VRAM_GB >= 44.0:
+        _OFFLOAD_ENABLED = False
+        pipe.to(device)
     else:
-        _OFFLOAD_TEXT_ENCODERS = True
-        pipe.text_encoder.to(device="cpu", dtype=torch.bfloat16).eval().requires_grad_(False)
-        pipe.text_encoder_2.to(device="cpu", dtype=torch.bfloat16).eval().requires_grad_(False)
+        _OFFLOAD_ENABLED = True
+        pipe.enable_model_cpu_offload()
 
-    pipe.__class__ = StableTrainingPipeline
     pipe.set_progress_bar_config(disable=True)
-
-    cfg_path = GLYPHATLAS_ROOT / "vendor" / "FluxText" / "train" / "config" / "word_512_size.yaml"
-    model_config = yaml.safe_load(cfg_path.read_text())["model"]
-
     _PIPE = pipe
-    _MODEL_CONFIG = model_config
     gc.collect()
     torch.cuda.empty_cache()
     print(
-        f"[GlyphAtlas] Pipeline ready in {time.monotonic() - t0:.1f}s "
-        f"(offload_text_encoders={_OFFLOAD_TEXT_ENCODERS}, dtype={pipe.dtype}, device={pipe.device})",
+        f"[Qwen2.1] Pipeline + Lightning LoRA ready in {time.monotonic() - t0:.1f}s "
+        f"(offload={_OFFLOAD_ENABLED}, vram={_VRAM_GB:.1f}GB, gpu={_GPU_NAME})",
         flush=True,
     )
-    return _PIPE, _MODEL_CONFIG
+    return _PIPE
 
 
-@torch.inference_mode()
-def _get_prompt_embeds(
-    pipe: StableTrainingPipeline,
-    prompt: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Encode prompt once with CLIP + T5-XXL and cache GPU tensors across all sheets."""
-    cached = _PROMPT_CACHE.get(prompt)
-    if cached is not None:
-        return cached
-
-    device = pipe.device
-    if _OFFLOAD_TEXT_ENCODERS:
-        pipe.text_encoder.to(device)
-        pipe.text_encoder_2.to(device)
-
-    prompt_embeds, pooled_prompt_embeds, _ = pipe.encode_prompt(
-        prompt=[prompt],
-        prompt_2=None,
-        device=device,
-        num_images_per_prompt=1,
-        max_sequence_length=512,
-    )
-
-    if _OFFLOAD_TEXT_ENCODERS:
-        pipe.text_encoder.to("cpu")
-        pipe.text_encoder_2.to("cpu")
-        torch.cuda.empty_cache()
-
-    # Keep cache small (last 8 prompts)
-    if len(_PROMPT_CACHE) >= 8:
-        _PROMPT_CACHE.pop(next(iter(_PROMPT_CACHE)))
-    _PROMPT_CACHE[prompt] = (prompt_embeds, pooled_prompt_embeds)
-    return prompt_embeds, pooled_prompt_embeds
-
-
-def _snap_bf16_guidance(val: float) -> float:
-    """GlyphAtlas expects guidance exact in BF16 (e.g. 1.0, 1.5, 2.0, 3.5)."""
-    v = float(max(0.5, min(7.0, val)))
-    return float(torch.tensor(v, dtype=torch.bfloat16).item())
+def _set_sampling_mode(pipe: QwenImage21Pipeline, use_lightning: bool) -> None:
+    global _LORA_ENABLED
+    if use_lightning:
+        if _LORA_LOADED and not _LORA_ENABLED:
+            pipe.enable_lora()
+            _LORA_ENABLED = True
+        if _LIGHTNING_SCHEDULER is not None:
+            pipe.scheduler = _LIGHTNING_SCHEDULER
+    else:
+        if _LORA_LOADED and _LORA_ENABLED:
+            pipe.disable_lora()
+            _LORA_ENABLED = False
+        if _BASE_SCHEDULER is not None:
+            pipe.scheduler = _BASE_SCHEDULER
 
 
 # ---------------------------------------------------------------------------
-# Reference image cleaning + top-strip placement
+# Reference & Skeleton Grid Builders
 # ---------------------------------------------------------------------------
-def _decode_pil(b64_str: str) -> Image.Image:
-    raw = base64.b64decode(b64_str)
-    im = Image.open(io.BytesIO(raw))
-    if im.mode in ("RGBA", "LA") or ("transparency" in im.info):
-        rgba = im.convert("RGBA")
-        bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-        bg.alpha_composite(rgba)
-        return bg.convert("RGB")
-    return im.convert("RGB")
-
-
-def _prepare_reference_canvas(ref_images_b64: list[str], collage_b64: str | None = None) -> np.ndarray:
+def _prepare_reference_image(
+    reference_images_b64: list[str],
+    collage_patch_b64: str | None,
+    target_max_side: int = 1024,
+) -> Image.Image:
     """
-    Build a 512x512 pure-white RGB uint8 canvas with the user's crisp reference
-    typography centered cleanly in the unmasked top strip (y = 8..168, x = 12..500).
+    Decode the user's primary reference image, normalize the background cleanly to pure #FFFFFF
+    while preserving exact ink stroke anti-aliasing and crisp contrast, trim outer whitespace,
+    and pad onto a clean rectangular #FFFFFF canvas so Qwen3-VL + VAE see every single detail.
     """
-    canvas = np.full((512, 512, 3), 255, dtype=np.uint8)
-
-    ref_im: Image.Image | None = None
-    if ref_images_b64:
+    src_pil: Image.Image | None = None
+    for b64 in reference_images_b64 or []:
+        if not b64:
+            continue
         try:
-            ref_im = _decode_pil(ref_images_b64[0])
+            raw = base64.b64decode(b64)
+            im = Image.open(io.BytesIO(raw))
+            if im.mode in ("RGBA", "LA"):
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[-1])
+                src_pil = bg
+            else:
+                src_pil = im.convert("RGB")
+            break
         except Exception:
-            ref_im = None
-    if ref_im is None and collage_b64:
-        try:
-            ref_im = _decode_pil(collage_b64)
-        except Exception:
-            ref_im = None
-    if ref_im is None:
-        return canvas
+            continue
 
-    gray = np.asarray(ref_im.convert("L"), dtype=np.uint8)
+    if src_pil is None and collage_patch_b64:
+        raw = base64.b64decode(collage_patch_b64)
+        src_pil = Image.open(io.BytesIO(raw)).convert("RGB")
 
-    # Detect inverted (white-on-dark) reference and flip to dark-on-white
-    border = np.concatenate([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])
-    if float(np.median(border)) < 120.0:
+    if src_pil is None:
+        return Image.new("RGB", (512, 256), (255, 255, 255))
+
+    gray = np.asarray(src_pil.convert("L"), dtype=np.uint8)
+    # Invert if light text on dark background
+    if float(np.median(gray)) < 120.0:
         gray = 255 - gray
 
-    # Gently normalize near-white background to pure 255 while keeping crisp anti-aliased thin strokes
-    bg_val = float(np.percentile(gray, 95))
-    fg_val = float(np.percentile(gray, 2))
-    span = max(25.0, bg_val - fg_val)
-    norm = np.clip((gray.astype(np.float32) - fg_val) / span * 255.0, 0.0, 255.0).astype(np.uint8)
-    # Push very light background dust (> 238) to pure 255
-    norm[norm > 238] = 255
+    # Normalize contrast gently: push near-white bg (> p90) to 255, dark ink (< p2) to 0
+    bg_hi = float(np.percentile(gray, 92))
+    ink_lo = float(np.percentile(gray, 1))
+    if bg_hi - ink_lo > 25.0:
+        norm = np.clip((gray.astype(np.float32) - ink_lo) / (bg_hi - ink_lo) * 255.0, 0, 255).astype(np.uint8)
+    else:
+        norm = gray
 
-    # Tightly crop ink bounding box
-    ink = norm < 220
-    ys, xs = np.where(ink)
-    if len(ys) > 0:
-        pad = 4
-        y0 = max(0, int(ys.min()) - pad)
-        y1 = min(norm.shape[0], int(ys.max()) + 1 + pad)
-        x0 = max(0, int(xs.min()) - pad)
-        x1 = min(norm.shape[1], int(xs.max()) + 1 + pad)
+    # Tightly crop non-white ink region with comfortable breathing margin
+    ys, xs = np.where(norm < 220)
+    if ys.size > 0 and xs.size > 0:
+        h, w = norm.shape
+        pad_y = max(12, int(0.12 * (ys.max() - ys.min() + 1)))
+        pad_x = max(16, int(0.05 * (xs.max() - xs.min() + 1)))
+        y0 = max(0, int(ys.min()) - pad_y)
+        y1 = min(h, int(ys.max()) + 1 + pad_y)
+        x0 = max(0, int(xs.min()) - pad_x)
+        x1 = min(w, int(xs.max()) + 1 + pad_x)
         norm = norm[y0:y1, x0:x1]
 
-    # If the reference is very tall (multi-line poster), pick the sharpest central text band
-    # so the reference letters stay ~75-110px tall matching our bottom glyph cells.
-    h, w = norm.shape
-    if h > w * 0.65 and h > 180:
-        row_ink = (norm < 210).sum(axis=1)
-        band_h = max(int(w * 0.35), min(h, 160))
-        # Find vertical window with maximum ink density
-        cs = np.cumsum(np.r_[0, row_ink])
-        scores = cs[band_h:] - cs[:-band_h]
-        best_y = int(np.argmax(scores))
-        norm = norm[best_y : best_y + band_h, :]
-        h, w = norm.shape
+    # Ensure crisp readability: upscale tiny strips to at least 768px wide (capped at target_max_side)
+    nh, nw = norm.shape
+    scale = 1.0
+    if max(nw, nh) > target_max_side:
+        scale = target_max_side / float(max(nw, nh))
+    elif nw < 768:
+        scale = min(3.0, 768.0 / float(max(1, nw)))
 
-    # Fit inside top strip (max_w = 488, max_h = 152) preserving exact aspect ratio
-    max_w, max_h = 488, 152
-    scale = min(max_w / max(1, w), max_h / max(1, h))
-    # Cap upscaling so tiny images stay sharp, and ensure reasonable visual height
-    new_w = max(16, min(max_w, int(round(w * scale))))
-    new_h = max(16, min(max_h, int(round(h * scale))))
+    new_w = max(64, int(round(nw * scale)))
+    new_h = max(64, int(round(nh * scale)))
+    # Round to multiples of 16 for clean VAE tokenization
+    new_w = max(64, ((new_w + 15) // 16) * 16)
+    new_h = max(64, ((new_h + 15) // 16) * 16)
 
-    pil_ref = Image.fromarray(norm, mode="L").resize((new_w, new_h), Image.Resampling.LANCZOS)
-    ref_arr = np.asarray(pil_ref, dtype=np.uint8)
-    ref_rgb = np.stack([ref_arr, ref_arr, ref_arr], axis=-1)
-
-    px = (512 - new_w) // 2
-    py = 12 + (156 - new_h) // 2
-    canvas[py : py + new_h, px : px + new_w] = ref_rgb
-    return canvas
+    resized = Image.fromarray(norm, mode="L").resize((new_w, new_h), Image.Resampling.LANCZOS).convert("RGB")
+    return resized
 
 
-# ---------------------------------------------------------------------------
-# Build GlyphAtlas inputs (condition, hint, atlas) for up to 8 glyphs per sheet
-# ---------------------------------------------------------------------------
-def _make_64_atlas_tile(skel_ink_bool: np.ndarray) -> np.ndarray:
+def _build_skeleton_grid(
+    batch: list[dict[str, Any]],
+    *,
+    grid_dim: int = 4,
+    canvas_px: int = 1024,
+    draw_grid_lines: bool = True,
+) -> tuple[Image.Image, list[tuple[int, int, int, int]], list[tuple[dict[str, Any], np.ndarray]]]:
     """
-    Create a 64x64 uint8 white-on-black tile matching GlyphAtlas `tile_for()` convention:
-    white glyph strokes (255) centered inside 54x54 on pure black (0) background.
+    Build a crisp black-on-white `canvas_px x canvas_px` specimen grid containing up to
+    `grid_dim * grid_dim` baseline-anchored HarfBuzz glyph skeletons.
     """
-    ys, xs = np.where(skel_ink_bool)
-    if len(ys) == 0:
-        return np.zeros((64, 64), dtype=np.uint8)
+    cell_px = canvas_px // grid_dim
+    canvas = Image.new("RGB", (canvas_px, canvas_px), (255, 255, 255))
+    boxes: list[tuple[int, int, int, int]] = []
+    parsed_items: list[tuple[dict[str, Any], np.ndarray]] = []
 
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    crop = (skel_ink_bool[y0:y1, x0:x1].astype(np.uint8)) * 255
-    ch, cw = crop.shape
+    for idx, g in enumerate(batch):
+        row = idx // grid_dim
+        col = idx % grid_dim
+        x0 = col * cell_px
+        y0 = row * cell_px
+        x1 = x0 + cell_px
+        y1 = y0 + cell_px
+        boxes.append((x0, y0, x1, y1))
 
-    ratio = min(54.0 / max(1, cw), 54.0 / max(1, ch))
-    nw = max(2, min(56, int(round(cw * ratio))))
-    nh = max(2, min(56, int(round(ch * ratio))))
-    resized = np.asarray(
-        Image.fromarray(crop, mode="L").resize((nw, nh), Image.Resampling.LANCZOS),
-        dtype=np.uint8,
-    )
-    tile = np.zeros((64, 64), dtype=np.uint8)
-    ox = (64 - nw) // 2
-    oy = (64 - nh) // 2
-    tile[oy : oy + nh, ox : ox + nw] = resized
-    return tile
+        raw_png = base64.b64decode(g["skeleton_png_b64"])
+        skel_im = Image.open(io.BytesIO(raw_png)).convert("L")
+        skel_arr = np.asarray(skel_im, dtype=np.uint8)
+        skel_ink = skel_arr < 128
+
+        # Render clean black (#000000) ink on pure white (#FFFFFF) into cell
+        cell_l = Image.fromarray(np.where(skel_ink, 0, 255).astype(np.uint8), mode="L").resize(
+            (cell_px, cell_px), Image.Resampling.LANCZOS
+        )
+        canvas.paste(cell_l.convert("RGB"), (x0, y0))
+        parsed_items.append((g, skel_ink))
+
+    if draw_grid_lines:
+        draw = ImageDraw.Draw(canvas)
+        line_color = (224, 224, 224)
+        for i in range(1, grid_dim):
+            pos = i * cell_px
+            draw.line([(pos, 0), (pos, canvas_px - 1)], fill=line_color, width=1)
+            draw.line([(0, pos), (canvas_px - 1, pos)], fill=line_color, width=1)
+
+    return canvas, boxes, parsed_items
 
 
-@torch.inference_mode()
-def _encode_custom_atlas(
-    pipe: StableTrainingPipeline,
-    tiles_64: list[np.ndarray],
-    cell_masks_512: list[np.ndarray],
-) -> dict[str, Any]:
+def _build_in_context_canvas(
+    ref_img: Image.Image,
+    batch: list[dict[str, Any]],
+    *,
+    grid_dim: int = 4,
+    canvas_px: int = 1024,
+    ref_strip_h: int = 256,
+    draw_grid_lines: bool = True,
+) -> tuple[Image.Image, list[tuple[int, int, int, int]], list[tuple[dict[str, Any], np.ndarray]]]:
     """
-    Encode custom 64x64 white-on-black glyph tiles through FLUX VAE and construct
-    the exact `atlas` dictionary expected by `AtlasTransformer` + `make_routes()`.
+    Optional single-image in-context layout:
+      - Top strip (0 .. ref_strip_h): crisp reference typography on pure white
+      - Bottom area (ref_strip_h .. canvas_px): glyph skeleton grid (rows x cols)
     """
-    device = pipe.device
-    dtype = pipe.dtype
-    k = len(tiles_64)
-    assert 1 <= k <= 8
+    canvas = Image.new("RGB", (canvas_px, canvas_px), (255, 255, 255))
 
-    arr = np.stack(tiles_64, axis=0)  # [K, 64, 64] uint8, white ink on black
-    tensor = (
-        torch.from_numpy(arr)
-        .to(device=device, dtype=dtype)[:, None]
-        .expand(-1, 3, -1, -1)
-        / 127.5
-        - 1.0
-    )
-    z = pipe.vae.encode(tensor).latent_dist.mean
-    z = (z - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
-    tokens = pipe._pack_latents(z, *z.shape).detach()  # [K, 16, 64]
-    features = tokens.reshape(1, k * 16, 64)
+    # Paste reference strip centered in top band
+    rw, rh = ref_img.size
+    max_w = canvas_px - 48
+    max_h = ref_strip_h - 32
+    sc = min(max_w / float(max(1, rw)), max_h / float(max(1, rh)))
+    tw = max(16, int(round(rw * sc)))
+    th = max(16, int(round(rh * sc)))
+    ref_fit = ref_img.resize((tw, th), Image.Resampling.LANCZOS)
+    canvas.paste(ref_fit, ((canvas_px - tw) // 2, (ref_strip_h - th) // 2))
 
-    owners = torch.arange(k, device=device, dtype=torch.long).repeat_interleave(16)
-    ids: list[list[float]] = []
-    geometry: list[list[float]] = []
-    for owner in range(k):
-        for y in range(4):
-            for x in range(4):
-                ids.append([1.0, float(owner * 4 + y), float(x)])
-                geometry.append([(x + 0.5) / 4.0, (y + 0.5) / 4.0, 0.0, 1.0 / 20.0])
+    # Fit glyph grid into remaining height
+    grid_h = canvas_px - ref_strip_h
+    rows = min(grid_dim, max(1, (len(batch) + grid_dim - 1) // grid_dim))
+    rows = max(rows, 3 if grid_dim == 4 else grid_dim)
+    cell_w = canvas_px // grid_dim
+    cell_h = grid_h // rows
+    inner = min(cell_w, cell_h)
 
-    masks_t = torch.stack(
-        [torch.from_numpy(m.astype(np.float32)).to(device=device) for m in cell_masks_512],
-        dim=0,
-    )  # [K, 512, 512]
-    region_map = F.avg_pool2d(masks_t[:, None], 16, 16).flatten(1).T > 0  # [1024, K]
-    routes = make_routes(region_map, owners)
+    boxes: list[tuple[int, int, int, int]] = []
+    parsed_items: list[tuple[dict[str, Any], np.ndarray]] = []
 
-    return {
-        "features": features,
-        "owners": owners,
-        "ids": torch.tensor(ids, device=device, dtype=torch.float32),
-        "geometry": torch.tensor(geometry, device=device, dtype=dtype)[None],
-        "regions": region_map,
-        "routes": routes,
-        "glyph_count": k,
-        "unit_count": k,
-    }
+    for idx, g in enumerate(batch[: rows * grid_dim]):
+        row = idx // grid_dim
+        col = idx % grid_dim
+        x0 = col * cell_w + (cell_w - inner) // 2
+        y0 = ref_strip_h + row * cell_h + (cell_h - inner) // 2
+        x1 = x0 + inner
+        y1 = y0 + inner
+        boxes.append((x0, y0, x1, y1))
+
+        raw_png = base64.b64decode(g["skeleton_png_b64"])
+        skel_im = Image.open(io.BytesIO(raw_png)).convert("L")
+        skel_arr = np.asarray(skel_im, dtype=np.uint8)
+        skel_ink = skel_arr < 128
+
+        cell_l = Image.fromarray(np.where(skel_ink, 0, 255).astype(np.uint8), mode="L").resize(
+            (inner, inner), Image.Resampling.LANCZOS
+        )
+        canvas.paste(cell_l.convert("RGB"), (x0, y0))
+        parsed_items.append((g, skel_ink))
+
+    if draw_grid_lines:
+        draw = ImageDraw.Draw(canvas)
+        draw.line([(0, ref_strip_h), (canvas_px - 1, ref_strip_h)], fill=(205, 205, 205), width=2)
+        for c in range(1, grid_dim):
+            draw.line([(c * cell_w, ref_strip_h), (c * cell_w, canvas_px - 1)], fill=(230, 230, 230), width=1)
+        for r in range(1, rows):
+            y = ref_strip_h + r * cell_h
+            draw.line([(0, y), (canvas_px - 1, y)], fill=(230, 230, 230), width=1)
+
+    return canvas, boxes, parsed_items
 
 
-def _build_style_prompt(job_input: dict[str, Any]) -> str:
+def _build_prompt(
+    job_input: dict[str, Any],
+    *,
+    grid_dim: int,
+    layout_mode: str,
+) -> str:
+    custom = str(job_input.get("custom_prompt") or "").strip()
+    if custom:
+        return custom
+
     mode = str(job_input.get("generation_mode") or "exact_clone").strip().lower()
     ref_tel = job_input.get("ref_telemetry") or {}
-    dot_shape = str(ref_tel.get("dot_shape") or "square")
-    stroke_ratio = float(ref_tel.get("ref_stroke_ratio") or 0.04)
-    extra = str(job_input.get("style_prompt") or "").strip()
+    dot_shape = str(ref_tel.get("dot_shape") or job_input.get("dot_style_override") or "").strip().lower()
+    stroke_ratio = float(ref_tel.get("ref_stroke_ratio") or 0.0)
+    contrast_ratio = float(ref_tel.get("stroke_contrast_ratio") or 1.0)
+    extra_style = str(job_input.get("style_prompt") or "").strip()
 
-    if stroke_ratio < 0.032:
-        weight_desc = "ultra-thin hairline monoline strokes"
-    elif stroke_ratio < 0.055:
-        weight_desc = "light clean monoline strokes"
-    elif stroke_ratio < 0.085:
-        weight_desc = "regular geometric strokes"
+    # Build objective physical cues from the reference image telemetry
+    cues: list[str] = []
+    if 0.0 < stroke_ratio <= 0.045:
+        cues.append("ultra-thin delicate uniform monoline hairline stroke weight with zero calligraphic brush taper")
+    elif 0.045 < stroke_ratio <= 0.085:
+        cues.append("clean light-to-regular geometric monoline stroke weight")
+    elif stroke_ratio > 0.12:
+        cues.append("bold heavy display stroke weight matching the reference")
+
+    if contrast_ratio <= 1.35:
+        cues.append("strictly uniform monoline stroke thickness everywhere (no thick-thin Naskh pen contrast)")
+    elif contrast_ratio >= 1.8:
+        cues.append("distinct calligraphic thick-thin stroke contrast matching the reference")
+
+    if dot_shape == "square":
+        cues.append("crisp solid sharp-cornered square diacritic dots matching the reference")
+    elif dot_shape == "diamond":
+        cues.append("sharp diamond-shaped diacritic dots matching the reference")
+    elif dot_shape == "round":
+        cues.append("clean circular diacritic dots matching the reference")
+
+    cue_str = ("; ".join(cues) + ". ") if cues else ""
+
+    if layout_mode == "in_context":
+        if mode == "inspired":
+            base = (
+                "Redraw every single black typography glyph in the bottom grid cells as an original, "
+                "commercial brand typeface inspired by the design language and aesthetic of the reference "
+                "typeface shown in the top strip, with refined distinctive curves and terminals. "
+                f"{cue_str}"
+                "Keep the top reference strip unchanged, and keep EVERY glyph in the bottom grid in its "
+                "EXACT cell position, baseline alignment, character identity, Arabic contextual joining shape, "
+                "and exact dot count. Pure flat #000000 black vector ink on pure #FFFFFF white background."
+            )
+        else:
+            base = (
+                "Redraw every single black typography glyph in the bottom grid cells so that EVERY glyph "
+                "is a 1:1 EXACT typeface clone of the Arabic/Latin font shown in the top reference strip — "
+                "matching its exact stroke thickness, exact geometric bowls, exact curves, exact terminals, "
+                "and exact dot shape. "
+                f"{cue_str}"
+                "Keep the top reference strip unchanged, and keep EVERY glyph in the bottom grid in its "
+                "EXACT cell position, baseline alignment, character identity, Arabic contextual joining form, "
+                "and exact dot count/placement. Pure flat #000000 black 2D vector ink on pure #FFFFFF white "
+                "background, no shading, no shadows, no texture."
+            )
     else:
-        weight_desc = "bold heavy display strokes"
+        grid_desc = f"{grid_dim}x{grid_dim}"
+        if mode == "inspired":
+            base = (
+                f"Edit the first image (a {grid_desc} grid of black typography glyphs on pure white) to design "
+                "an original, cohesive custom typeface inspired by the aesthetic and geometric proportions of "
+                "the reference font shown in the second image, while introducing fresh refined terminals and "
+                "distinctive character. "
+                f"{cue_str}"
+                f"Preserve EVERY glyph's exact {grid_desc} grid cell position, baseline alignment, character "
+                "identity, Arabic contextual joining form (isolated/initial/medial/final), and exact dot count "
+                "from the first image. Render razor-sharp flat pure black (#000000) 2D vector-style glyphs on "
+                "pure white (#FFFFFF) with no shadows, no gradients, no extra text, and no borders."
+            )
+        else:
+            base = (
+                f"Edit the first image (a {grid_desc} grid of black typography glyphs on pure white) so that "
+                "EVERY single glyph in the grid is redrawn as a 1:1 EXACT clone of the typeface shown in the "
+                "second reference image — transferring its exact stroke thickness, exact monoline/contrast profile, "
+                "exact wide circular bowls and geometric curves, exact stem terminals, and exact dot geometry. "
+                f"{cue_str}"
+                f"Strictly preserve EVERY glyph's exact {grid_desc} grid cell position, baseline height, "
+                "character identity, Arabic contextual joining shape (isolated/initial/medial/final), and exact "
+                "diacritic dot count and placement from the first image. Do NOT add or remove dots or letters. "
+                "Render razor-sharp flat pure black (#000000) 2D vector-like glyphs on pure solid white (#FFFFFF) "
+                "with zero shadows, zero gradients, zero textures, and zero extra symbols."
+            )
 
-    dot_desc = (
-        "bold crisp solid square dots"
-        if dot_shape == "square"
-        else "crisp diamond dots"
-        if dot_shape == "diamond"
-        else "clean circular dots"
-    )
-
-    if mode == "exact_clone":
-        base = (
-            "A crisp high-contrast black-on-white typography specimen sheet. "
-            "Every individual letter in the bottom grid is drawn in the EXACT SAME custom typeface design "
-            f"as the reference lettering shown at the top of the page, matching its {weight_desc}, "
-            f"exact wide open geometric bowls, letterform anatomy, terminal cuts, and {dot_desc}. "
-            "Pure solid black vector glyph ink on a flat pure white background, clean 2D typography, no shadows, no gradients."
-        )
-    else:
-        base = (
-            "A crisp high-contrast black-on-white typography specimen sheet. "
-            "Every individual letter in the bottom grid is an original custom brand display typeface "
-            "harmoniously inspired by the reference lettering shown at the top of the page, "
-            f"featuring refined {weight_desc}, distinctive custom terminals, and {dot_desc}. "
-            "Pure solid black vector glyph ink on a flat pure white background, clean 2D typography, no shadows."
-        )
-    if extra and len(extra) < 220:
-        base = f"{base} Style notes: {extra}."
+    if extra_style and len(extra_style) < 260:
+        base = f"{base} Additional typography notes: {extra_style}."
     return base
 
 
@@ -515,38 +543,46 @@ def _extract_cell_mask(
     scale: float,
     is_arabic_joining: bool,
     preserve_arabic_connectors: bool,
+    trim_border_px: int = 5,
 ) -> np.ndarray:
     """
-    Upscale the 112x112 generated cell to canvas_size with smooth bicubic interpolation,
-    threshold cleanly (preserving ultra-thin hairline strokes!), clean tiny noise specks,
-    and gently ensure thin stroke-matched Arabic cursive entry/exit bridges.
+    Extract a razor-sharp binary glyph mask from a 256x256 (or 341x341) generated cell,
+    preserving ultra-thin geometric hairlines and square dots, stripping any faint grid lines,
+    and locking Arabic cursive baseline connectors at the generated glyph's own stroke weight.
     """
     gray_small = cv2.cvtColor(cell_rgb, cv2.COLOR_RGB2GRAY)
+
+    # Clear faint grid divider lines along the outer cell border BEFORE resizing
+    if trim_border_px > 0 and min(gray_small.shape) > trim_border_px * 3:
+        gray_small = gray_small.copy()
+        gray_small[:trim_border_px, :] = 255
+        gray_small[-trim_border_px:, :] = 255
+        gray_small[:, :trim_border_px] = 255
+        gray_small[:, -trim_border_px:] = 255
+
     gray_big = np.asarray(
         Image.fromarray(gray_small, mode="L").resize((canvas_size, canvas_size), Image.Resampling.BICUBIC),
         dtype=np.uint8,
     )
 
-    # Adaptive luminance threshold tuned to keep thin anti-aliased hairlines intact
-    bg_med = float(np.percentile(gray_big, 92))
-    ink_p2 = float(np.percentile(gray_big, 1))
-    contrast = bg_med - ink_p2
-    if contrast < 30.0:
-        # Almost blank cell — fallback safely to skeleton
+    # Adaptive luminance threshold tuned to preserve thin anti-aliased hairlines cleanly
+    bg_med = float(np.percentile(gray_big, 95))
+    ink_p1 = float(np.percentile(gray_big, 0.5))
+    contrast = bg_med - ink_p1
+    if contrast < 35.0:
         return skel_ink.copy()
 
-    # For thin hairlines, anti-aliased stroke centers can sit at ~130-175 gray;
-    # placing threshold at 62% from dark ink toward white background captures hairlines crisply!
-    thresh = int(round(min(212.0, max(128.0, ink_p2 + 0.62 * contrast))))
+    # Keep ultra-thin hairlines crisp (threshold at 58% from ink toward white, ignoring faint #E0E0E0 grid lines)
+    thresh = int(round(min(205.0, max(120.0, ink_p1 + 0.58 * contrast))))
     mask = gray_big < thresh
 
-    # Clear 2px outer border artifacts
-    mask[:2, :] = False
-    mask[-2:, :] = False
-    mask[:, :2] = False
-    mask[:, -2:] = False
+    # Clear 3px outer border
+    mask[:3, :] = False
+    mask[-3:, :] = False
+    mask[:, :3] = False
+    mask[:, -3:] = False
 
-    # Remove tiny noise specks (< 10 px at 384px, preserving every real dot which is >= 25 px)
+    # Remove tiny noise specks (< 10 px at 384px, preserving every real dot)
     labeled, num = ndimage.label(mask)
     if num > 0:
         min_area = max(8, int((canvas_size / 384.0) ** 2 * 10))
@@ -557,16 +593,13 @@ def _extract_cell_mask(
 
     # Gentle anti-staircase smooth before vtracer
     if mask.any():
-        blurred = ndimage.gaussian_filter(mask.astype(np.float32), sigma=0.75)
+        blurred = ndimage.gaussian_filter(mask.astype(np.float32), sigma=0.6)
         mask = blurred >= 0.48
 
-    # Sanity check: if completely empty, fallback to skeleton
-    if int(mask.sum()) < 24:
+    if int(mask.sum()) < 20:
         return skel_ink.copy()
 
-    # Stroke-matched Arabic cursive baseline connector lock:
-    # Only if the original skeleton connects at left (x=0) or right (x=advance_width) on the baseline,
-    # ensure the generated glyph ALSO reaches that exact edge at the generated glyph's OWN stroke thickness!
+    # Stroke-matched Arabic cursive baseline connector lock
     if preserve_arabic_connectors and is_arabic_joining:
         dist_gen = ndimage.distance_transform_edt(mask)
         nonzero_r = dist_gen[mask]
@@ -576,11 +609,11 @@ def _extract_cell_mask(
         y_top = max(0, int(round(baseline_y_px - 220.0 * scale)))
         y_bot = min(canvas_size, int(round(baseline_y_px + 70.0 * scale)))
         if y_bot > y_top:
-            # Left exit (x = origin_x_px)
             exit_x = max(2, min(canvas_size - 3, int(round(origin_x_px))))
-            skel_exit_rows = np.where(skel_ink[y_top:y_bot, max(0, exit_x - 2) : min(canvas_size, exit_x + 6)].any(axis=1))[0]
+            skel_exit_rows = np.where(
+                skel_ink[y_top:y_bot, max(0, exit_x - 2) : min(canvas_size, exit_x + 6)].any(axis=1)
+            )[0]
             if skel_exit_rows.size > 0:
-                # Find generated ink near the exit band (within 24px to the right)
                 search_x1 = min(canvas_size, exit_x + int(round(28 * canvas_size / 384.0)))
                 gen_band = mask[y_top:y_bot, exit_x:search_x1]
                 if gen_band.any():
@@ -588,11 +621,15 @@ def _extract_cell_mask(
                     first_x = exit_x + int(gx_rel.min())
                     cy = y_top + int(round(float(np.median(gy_rel[gx_rel <= gx_rel.min() + 3]))))
                     if first_x > exit_x - 2:
-                        mask[max(0, cy - half_t) : min(canvas_size, cy + half_t + 1), max(0, exit_x - 2) : first_x + 2] = True
+                        mask[
+                            max(0, cy - half_t) : min(canvas_size, cy + half_t + 1),
+                            max(0, exit_x - 2) : first_x + 2,
+                        ] = True
 
-            # Right entry (x = origin_x_px + advance_width * scale)
             entry_x = max(2, min(canvas_size - 3, int(round(origin_x_px + advance_width * scale))))
-            skel_entry_rows = np.where(skel_ink[y_top:y_bot, max(0, entry_x - 6) : min(canvas_size, entry_x + 3)].any(axis=1))[0]
+            skel_entry_rows = np.where(
+                skel_ink[y_top:y_bot, max(0, entry_x - 6) : min(canvas_size, entry_x + 3)].any(axis=1)
+            )[0]
             if skel_entry_rows.size > 0:
                 search_x0 = max(0, entry_x - int(round(28 * canvas_size / 384.0)))
                 gen_band = mask[y_top:y_bot, search_x0 : min(canvas_size, entry_x + 2)]
@@ -601,12 +638,15 @@ def _extract_cell_mask(
                     last_x = search_x0 + int(gx_rel.max())
                     cy = y_top + int(round(float(np.median(gy_rel[gx_rel >= gx_rel.max() - 3]))))
                     if last_x < entry_x + 2:
-                        mask[max(0, cy - half_t) : min(canvas_size, cy + half_t + 1), max(0, last_x - 1) : min(canvas_size, entry_x + 3)] = True
+                        mask[
+                            max(0, cy - half_t) : min(canvas_size, cy + half_t + 1),
+                            max(0, last_x - 1) : min(canvas_size, entry_x + 3),
+                        ] = True
 
     return mask
 
 
-def _mask_to_svg(mask: np.ndarray, speckle_threshold: int = 6) -> str:
+def _mask_to_svg(mask: np.ndarray, speckle_threshold: int = 4) -> str:
     img_arr = np.where(mask, 0, 255).astype(np.uint8)
     im = Image.fromarray(img_arr, mode="L").convert("RGB")
     buf = io.BytesIO()
@@ -639,7 +679,6 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     action = str(job_input.get("action") or "synthesize").strip().lower()
 
     if action == "diag":
-        import shutil
         gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
         vram = round(torch.cuda.get_device_properties(0).total_memory / (1024.0 ** 3), 1) if torch.cuda.is_available() else 0.0
         disk_app = shutil.disk_usage("/app")
@@ -653,6 +692,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             pass
         return {
             "status": "ok",
+            "engine": "qwen_image_21_gpu",
             "gpu": gpu,
             "vram_gb": vram,
             "app_free_gb": round(disk_app.free / (1024.0 ** 3), 1),
@@ -662,7 +702,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         }
 
     try:
-        pipe, model_config = _ensure_pipeline()
+        pipe = _ensure_pipeline()
     except Exception as exc:
         traceback.print_exc()
         return {"error": f"Pipeline init failed: {exc}", "traceback": traceback.format_exc()}
@@ -670,10 +710,11 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     if action in ("ping", "warmup"):
         return {
             "status": "ok",
-            "engine": "glyphatlas_12b_flux_gpu",
+            "engine": "qwen_image_21_gpu",
             "gpu": _GPU_NAME,
             "vram_gb": round(_VRAM_GB, 1),
-            "offload_text_encoders": _OFFLOAD_TEXT_ENCODERS,
+            "offload": _OFFLOAD_ENABLED,
+            "lora_loaded": _LORA_LOADED,
             "elapsed_s": round(time.monotonic() - t_start, 2),
         }
 
@@ -683,120 +724,119 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
 
     mode = str(job_input.get("generation_mode") or "exact_clone").strip().lower()
     preserve_connectors = bool(job_input.get("preserve_arabic_connectors", True))
-    speckle_threshold = int(job_input.get("vtracer_speckle_threshold", 6))
+    speckle_threshold = int(job_input.get("vtracer_speckle_threshold", 4))
     return_debug_sheets = bool(job_input.get("return_debug_sheets", False))
     return_masks = bool(job_input.get("return_masks", False))
 
-    # Sampling hyperparameters (official GlyphAtlas uses steps=10, guidance=1.0)
-    default_steps = 12 if mode == "exact_clone" else 14
-    steps = int(job_input.get("glyphatlas_steps") or default_steps)
-    steps = max(6, min(28, steps))
+    # Runtime-tunable Qwen-Image-2.1 synthesis controls
+    layout_mode = str(job_input.get("layout_mode") or "dual_image").strip().lower()
+    grid_dim = int(job_input.get("grid_dim") or 4)
+    grid_dim = max(2, min(4, grid_dim))
+    canvas_px = int(job_input.get("canvas_px") or 1024)
+    canvas_px = 1024 if canvas_px <= 1024 else 2048
+    draw_grid_lines = bool(job_input.get("draw_grid_lines", True))
+    use_lightning = bool(job_input.get("use_lightning", True))
+    true_cfg_scale = float(job_input.get("true_cfg_scale", 1.0))
+    negative_prompt = str(job_input.get("negative_prompt") or "").strip() or None
 
-    default_guidance = 1.0 if mode == "exact_clone" else 2.0
-    guidance = _snap_bf16_guidance(float(job_input.get("glyphatlas_guidance") or default_guidance))
+    if use_lightning:
+        steps = int(job_input.get("qwen_steps") or 4)
+        steps = max(4, min(8, steps))
+        sigmas = [round(1.0 - i / float(steps), 4) for i in range(steps)]
+    else:
+        steps = int(job_input.get("qwen_steps") or 20)
+        steps = max(8, min(40, steps))
+        sigmas = None
+
+    _set_sampling_mode(pipe, use_lightning=use_lightning)
 
     seed_base = int(job_input.get("differentiation_seed") or 42)
-    prompt = _build_style_prompt(job_input)
+    prompt = _build_prompt(job_input, grid_dim=grid_dim, layout_mode=layout_mode)
 
-    # Encode prompt ONCE for the entire font job
-    prompt_embeds, pooled_prompt_embeds = _get_prompt_embeds(pipe, prompt)
-
-    # Prepare unmasked top reference strip canvas (512x512 uint8 RGB)
-    ref_canvas_u8 = _prepare_reference_canvas(
+    ref_img = _prepare_reference_image(
         job_input.get("reference_images_b64") or [],
         job_input.get("collage_patch_b64"),
+        target_max_side=canvas_px,
     )
-    # Convert to torch tensor [1, 3, 512, 512] float32 in [0.0, 1.0]
-    img_tensor = torch.from_numpy(ref_canvas_u8).permute(2, 0, 1).float().div(255.0).unsqueeze(0)
 
+    per_sheet = (grid_dim * grid_dim) if layout_mode != "in_context" else (grid_dim * (3 if grid_dim == 4 else grid_dim))
     glyph_svgs: dict[str, str] = {}
     glyph_masks_b64: dict[str, str] = {}
-    debug_sheets_b64: list[dict[str, str]] = []
+    debug_sheets_b64: list[dict[str, Any]] = []
 
     sheets_run = 0
-    for batch_idx, start in enumerate(range(0, len(glyphs), 8)):
-        batch = glyphs[start : start + 8]
-        k = len(batch)
+    gen_device = "cuda" if not _OFFLOAD_ENABLED else "cpu"
 
-        cond_gray = np.zeros((512, 512), dtype=np.float32)
-        hint_gray = np.zeros((512, 512), dtype=np.float32)
-        tiles_64: list[np.ndarray] = []
-        cell_masks: list[np.ndarray] = []
-        parsed_items: list[tuple[dict[str, Any], np.ndarray]] = []
+    for batch_idx, start in enumerate(range(0, len(glyphs), per_sheet)):
+        batch = glyphs[start : start + per_sheet]
 
-        for idx, g in enumerate(batch):
-            x0, y0, x1, y1 = CELL_BOXES[idx]
-            raw_png = base64.b64decode(g["skeleton_png_b64"])
-            skel_im = Image.open(io.BytesIO(raw_png)).convert("L")
-            skel_arr = np.asarray(skel_im, dtype=np.uint8)
-            skel_ink = skel_arr < 128
-
-            # White ink (255) on black (0) resized into INNER_BOX x INNER_BOX (112x112)
-            inv_u8 = np.where(skel_ink, 255, 0).astype(np.uint8)
-            small_u8 = np.asarray(
-                Image.fromarray(inv_u8, mode="L").resize((INNER_BOX, INNER_BOX), Image.Resampling.LANCZOS),
-                dtype=np.uint8,
+        if layout_mode == "in_context":
+            skel_grid_img, boxes, parsed_items = _build_in_context_canvas(
+                ref_img,
+                batch,
+                grid_dim=grid_dim,
+                canvas_px=canvas_px,
+                draw_grid_lines=draw_grid_lines,
             )
-            cond_gray[y0 + INNER_Y_PAD : y0 + INNER_Y_PAD + INNER_BOX, x0 : x0 + INNER_BOX] = (
-                small_u8.astype(np.float32) / 255.0
+            cond_images: Any = skel_grid_img
+        else:
+            skel_grid_img, boxes, parsed_items = _build_skeleton_grid(
+                batch,
+                grid_dim=grid_dim,
+                canvas_px=canvas_px,
+                draw_grid_lines=draw_grid_lines,
             )
-
-            # Mask full 112x144 cell (exact 16px latent boundaries!)
-            hint_gray[y0:y1, x0:x1] = 1.0
-            cm = np.zeros((512, 512), dtype=np.float32)
-            cm[y0:y1, x0:x1] = 1.0
-            cell_masks.append(cm)
-
-            tiles_64.append(_make_64_atlas_tile(skel_ink))
-            parsed_items.append((g, skel_ink))
-
-        condition_3ch = np.stack([cond_gray, cond_gray, cond_gray], axis=-1)
-        hint_3ch = np.stack([hint_gray, hint_gray, hint_gray], axis=-1)
+            cond_images = [skel_grid_img, ref_img]
 
         sheet_seed = (seed_base + batch_idx * 97) % (2 ** 31 - 1)
+        call_kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "image": cond_images,
+            "width": canvas_px,
+            "height": canvas_px,
+            "num_inference_steps": steps,
+            "true_cfg_scale": true_cfg_scale,
+            "use_kv_cache": not use_lightning,
+            "generator": torch.Generator(device=gen_device).manual_seed(sheet_seed),
+        }
+        if sigmas is not None:
+            call_kwargs["sigmas"] = sigmas
+        if true_cfg_scale > 1.0 and negative_prompt:
+            call_kwargs["negative_prompt"] = negative_prompt
+
+        t_sheet = time.monotonic()
         with torch.inference_mode():
-            atlas = _encode_custom_atlas(pipe, tiles_64, cell_masks)
-            cond = Condition(
-                condition_type="word_fill",
-                condition=[condition_3ch, hint_3ch, img_tensor],
-                position_delta=[0, 0],
-            )
-            gen_out = generate_fill(
-                pipe,
-                prompt=None,
-                prompt_2=None,
-                prompt_embeds=prompt_embeds,
-                pooled_prompt_embeds=pooled_prompt_embeds,
-                conditions=[cond],
-                height=512,
-                width=512,
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                generator=torch.Generator(device=pipe.device).manual_seed(sheet_seed),
-                model_config=dict(model_config, atlas=atlas),
-                default_lora=True,
-            )
-            result_pil: Image.Image = gen_out.images[0]
+            out = pipe(**call_kwargs)
+            result_pil: Image.Image = out.images[0]
+        sheet_elapsed = round(time.monotonic() - t_sheet, 2)
+        print(
+            f"[Qwen2.1] Sheet {batch_idx} ({len(parsed_items)} glyphs, lightning={use_lightning}, "
+            f"steps={steps}, layout={layout_mode}) done in {sheet_elapsed}s",
+            flush=True,
+        )
+
+        if result_pil.size != (canvas_px, canvas_px):
+            result_pil = result_pil.resize((canvas_px, canvas_px), Image.Resampling.LANCZOS)
 
         result_rgb = np.asarray(result_pil.convert("RGB"), dtype=np.uint8)
         sheets_run += 1
 
-        if return_debug_sheets and len(debug_sheets_b64) < 3:
-            cond_vis = Image.fromarray(np.uint8(np.clip(cond_gray, 0, 1) * 255), mode="L")
-            ref_vis = Image.fromarray(ref_canvas_u8, mode="RGB")
+        if return_debug_sheets and len(debug_sheets_b64) < 4:
             debug_sheets_b64.append(
                 {
                     "sheet_index": batch_idx,
-                    "glyph_names": [g["glyph_name"] for g in batch],
+                    "sheet_elapsed_s": sheet_elapsed,
+                    "glyph_names": [g["glyph_name"] for g, _ in parsed_items],
                     "result_png_b64": _pil_to_b64(result_pil),
-                    "condition_png_b64": _pil_to_b64(cond_vis),
-                    "input_canvas_png_b64": _pil_to_b64(ref_vis),
+                    "skeleton_grid_png_b64": _pil_to_b64(skel_grid_img),
+                    "reference_png_b64": _pil_to_b64(ref_img),
                 }
             )
 
+        trim_px = 6 if draw_grid_lines else 2
         for idx, (g, skel_ink) in enumerate(parsed_items):
-            x0, y0, x1, y1 = CELL_BOXES[idx]
-            cell_rgb = result_rgb[y0 + INNER_Y_PAD : y0 + INNER_Y_PAD + INNER_BOX, x0 : x0 + INNER_BOX, :]
+            x0, y0, x1, y1 = boxes[idx]
+            cell_rgb = result_rgb[y0:y1, x0:x1, :]
             canvas_size = int(g.get("canvas_size") or skel_ink.shape[0])
 
             out_mask = _extract_cell_mask(
@@ -809,6 +849,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 scale=float(g.get("scale", canvas_size / 1620.0)),
                 is_arabic_joining=bool(g.get("is_arabic_joining", False)),
                 preserve_arabic_connectors=preserve_connectors,
+                trim_border_px=trim_px,
             )
 
             gname = g["glyph_name"]
@@ -817,21 +858,24 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 m_u8 = np.where(out_mask, 0, 255).astype(np.uint8)
                 glyph_masks_b64[gname] = _pil_to_b64(Image.fromarray(m_u8, mode="L"))
 
-        del atlas, cond, gen_out
-        if batch_idx % 6 == 5:
+        del out
+        if batch_idx % 4 == 3:
             torch.cuda.empty_cache()
 
     gc.collect()
     torch.cuda.empty_cache()
 
     resp: dict[str, Any] = {
-        "engine": "glyphatlas_12b_flux_gpu",
+        "engine": "qwen_image_21_gpu",
         "generation_mode": mode,
+        "layout_mode": layout_mode,
+        "use_lightning": use_lightning,
         "gpu": _GPU_NAME,
         "vram_gb": round(_VRAM_GB, 1),
         "sheets_run": sheets_run,
         "steps": steps,
-        "guidance": guidance,
+        "grid_dim": grid_dim,
+        "canvas_px": canvas_px,
         "glyphs_processed": len(glyph_svgs),
         "elapsed_s": round(time.monotonic() - t_start, 2),
         "glyph_svgs": glyph_svgs,
